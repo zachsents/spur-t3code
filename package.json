@@ -1,10 +1,10 @@
 {
-  "name": "spur-t3code",
+  "name": "switch-ext-t3code",
   "version": "0.1.0",
   "private": true,
-  "description": "T3 Code's threads, as a Switch spur: a turn finishing, or a thread waiting on an answer.",
+  "description": "T3 Code's threads, as a Switch extension: a turn finishing, or a thread waiting on an answer.",
   "license": "MIT",
-  "repository": "github:zachsents/spur-t3code",
+  "repository": "github:zachsents/switch-ext-t3code",
   "type": "module",
   "scripts": {
     "start": "bun src/main.ts",
@@ -17,7 +17,7 @@
   "dependencies": {
     "@modelcontextprotocol/server": "^2.4.0",
     "effect": "^4.1.5",
-    "spur-kit": "github:zachsents/spur-kit#399e797"
+    "switch-ext-kit": "github:zachsents/switch-ext-kit#8a500e4"
   },
   "devDependencies": {
     "@types/bun": "^1.4.5",
@@ -27,7 +27,7 @@
     "oxlint-tsgolint": "^7.0.2007",
     "ultracite": "^8.3.1"
   },
-  "spur": {
+  "extension": {
     "name": "t3code",
     "main": "src/main.ts",
     "needs": [

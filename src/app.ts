@@ -1,13 +1,13 @@
 // T3 Code's threads on this machine: a turn finishing, or a thread waiting on the user, as events.
 // T3 pushes nothing to an outside client, so its MCP endpoint is polled: each project's open
 // (unsettled) threads and their latest runs, compared with the last look, so a turn shorter than
-// the poll is still told. The last look is kept in a file, so is a turn that ends while the spur
-// is down.
+// the poll is still told. The last look is kept in a file, so is a turn that ends while the
+// extension is down.
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import { Context, Effect, Layer, Option, Ref, Schema } from "effect"
-import { AppEvents, defineApp, defineEvent, tool } from "spur-kit"
-import type { Draft } from "spur-kit"
+import { AppEvents, defineApp, defineEvent, tool } from "switch-ext-kit"
+import type { Draft } from "switch-ext-kit"
 
 import { makeT3 } from "./t3.ts"
 import type { T3 } from "./t3.ts"
@@ -22,7 +22,7 @@ const RECENT = 20
 
 const link = (thread: string) => `t3-thread://v1/${thread}`
 
-// What the spur reads of T3's answers; the rest is let through.
+// What the extension reads of T3's answers; the rest is let through.
 const ProjectList = Schema.Struct({
   projects: Schema.Array(Schema.Struct({ id: Schema.String, title: Schema.String })),
   nextCursor: Schema.optionalKey(Schema.NullOr(Schema.Unknown)),

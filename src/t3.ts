@@ -1,5 +1,5 @@
 // A local T3 Code server, through its MCP endpoint. Where it listens is in its runtime file; the
-// spur holds a read-only client session minted by T3's own CLI, kept in a file of its own and
+// extension holds a read-only client session minted by T3's own CLI, kept in a file of its own and
 // renewed before it expires.
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
