@@ -1,7 +1,8 @@
 // T3 Code's threads on this machine: a turn finishing, or a thread waiting on the user, as events.
-// T3 pushes nothing to an outside client, so its MCP endpoint is polled: each project's threads
-// with a run under way, compared with the last look. What was under way is kept in a file, so a
-// turn that ends while the spur is down is still told.
+// T3 pushes nothing to an outside client, so its MCP endpoint is polled: each project's open
+// (unsettled) threads and their latest runs, compared with the last look, so a turn shorter than
+// the poll is still told. The last look is kept in a file, so is a turn that ends while the spur
+// is down.
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import { Context, Effect, Layer, Option, Ref, Schema } from "effect"
@@ -12,7 +13,8 @@ import { makeT3 } from "./t3.ts"
 import type { T3 } from "./t3.ts"
 
 const POLL = "4 seconds"
-const PROJECTS_EVERY_MS = 60_000
+/** A thread first seen with a turn that ended is told only if it ended this lately. */
+const FRESH = Temporal.Duration.from({ minutes: 10 })
 const UNDER_WAY = ["preparing", "queued", "starting", "running", "waiting"] as const
 const ENDED = ["completed", "failed", "interrupted", "cancelled", "rolled_back"] as const
 const REPLY_CHARS = 2000
@@ -116,7 +118,9 @@ const tracked = Schema.Struct({
   project: Schema.String,
   status: Schema.String,
   run: Schema.NullOr(Schema.String),
-  since: Schema.String,
+  /** The last run told as ended. */
+  told: Schema.NullOr(Schema.String),
+  updatedAt: Schema.String,
 })
 type Tracked = typeof tracked.Type
 const finished = Schema.Struct({
@@ -128,7 +132,7 @@ const finished = Schema.Struct({
 })
 type Finished = typeof finished.Type
 const state = Schema.Struct({
-  underWay: Schema.Array(tracked),
+  threads: Schema.Array(tracked),
   recent: Schema.Array(finished),
 })
 type State = typeof state.Type
@@ -138,6 +142,19 @@ const decode =
   <A>(schema: Schema.Codec<A, unknown>) =>
   (raw: unknown) =>
     Schema.decodeUnknownEffect(schema)(raw).pipe(Effect.mapError((e) => e.message))
+
+const isUnderWay = (status: string) => UNDER_WAY.some((s) => s === status)
+const isEnded = (status: string) => ENDED.some((s) => s === status)
+const isFresh = (at: string) =>
+  Temporal.Instant.compare(Temporal.Instant.from(at).add(FRESH), Temporal.Now.instant()) >= 0
+
+/** A run that was under way and hasn't been told as ended. */
+const untold = (t: Tracked) =>
+  isUnderWay(t.status) && t.run !== null && t.run !== t.told ? t.run : null
+/** What the first look keeps as told: a run that already ended. */
+const seed = (t: Tracked) => (isEnded(t.status) ? t.run : null)
+
+type Tell = (t: Tracked, runId: string) => Effect.Effect<void>
 
 const isReply = (i: { readonly type: string; readonly text?: string | null }) =>
   i.type === "assistant_message" && typeof i.text === "string" && i.text !== ""
@@ -166,12 +183,11 @@ export class Watch extends Context.Service<
           }
         })
         const ref = yield* Ref.make<State>(
-          Option.getOrElse(loaded, () => ({ underWay: [], recent: [] })),
+          Option.getOrElse(loaded, () => ({ threads: [], recent: [] })),
         )
         // Nothing to compare the first look with: it only seeds.
         let seeded = Option.isSome(loaded)
         const projects = new Map<string, string>()
-        let projectsAt = 0
 
         const save = (s: State) =>
           Effect.sync(() => {
@@ -182,9 +198,6 @@ export class Watch extends Context.Service<
         const projectName = (id: string) => projects.get(id) ?? id
 
         const loadProjects = Effect.gen(function* listing() {
-          if (projects.size > 0 && Date.now() - projectsAt < PROJECTS_EVERY_MS) {
-            return
-          }
           const list = yield* t3
             .call("t3_project_list", {})
             .pipe(Effect.flatMap(decode(ProjectList)))
@@ -192,18 +205,22 @@ export class Watch extends Context.Service<
           for (const p of list.projects) {
             projects.set(p.id, p.title)
           }
-          projectsAt = Date.now()
         })
 
-        const underWay = Effect.gen(function* looking() {
+        /** Every project's open threads, but a provider's own subagents, which run inside their parent's turn. */
+        const open = Effect.gen(function* looking() {
           yield* loadProjects
           const seen: Tracked[] = []
           for (const [id, title] of projects) {
             const list = yield* t3
-              .call("t3_thread_list", { projectId: id, statuses: UNDER_WAY, limit: 100 })
+              .call("t3_thread_list", {
+                projectId: id,
+                settled: false,
+                includeSubagents: false,
+                limit: 100,
+              })
               .pipe(Effect.flatMap(decode(ThreadList)))
             for (const t of list.threads) {
-              // A provider's own subagents run inside their parent's turn, which is told instead.
               if (t.relationshipToParent !== "subagent") {
                 seen.push({
                   thread: t.threadId,
@@ -211,7 +228,8 @@ export class Watch extends Context.Service<
                   project: title,
                   status: t.status,
                   run: t.latestRunId,
-                  since: t.updatedAt,
+                  told: null,
+                  updatedAt: t.updatedAt,
                 })
               }
             }
@@ -238,10 +256,11 @@ export class Watch extends Context.Service<
             return clip(reply?.text ?? "", REPLY_CHARS)
           })
 
-        const tellFinished = (was: Tracked) =>
+        /** Tells that `runId` ended, if it did. */
+        const tellFinished = (was: Tracked, runId: string) =>
           Effect.gen(function* telling() {
             const head = yield* readThread(was.thread, { limit: 1, runLimit: 5 })
-            const run = head.recentRuns.find((r) => r.runId === was.run) ?? head.recentRuns[0]
+            const run = head.recentRuns.find((r) => r.runId === runId)
             const status = Option.getOrUndefined(Schema.decodeUnknownOption(ended)(run?.status))
             if (run === undefined || status === undefined) {
               return Option.none<Finished>()
@@ -298,40 +317,60 @@ export class Watch extends Context.Service<
             )
           })
 
+        /** What changed on one open thread since the last look; answers the last run told. */
+        const compare = (n: Tracked, w: Tracked | undefined, tell: Tell) =>
+          Effect.gen(function* comparingOne() {
+            let told = w ? w.told : null
+            // The run under way last time ended, and another began since.
+            const before = w ? untold(w) : null
+            if (before !== null && before !== n.run) {
+              yield* tell(n, before)
+            }
+            const fresh = w !== undefined || isFresh(n.updatedAt)
+            if (isEnded(n.status) && n.run !== null && n.run !== told && fresh) {
+              yield* tell(n, n.run)
+              told = n.run
+            }
+            if (n.status === "waiting" && (w?.status !== "waiting" || w.run !== n.run)) {
+              yield* tellWaiting(n).pipe(Effect.catch((error) => Effect.logWarning(error)))
+            }
+            return told
+          })
+
         const look = Effect.gen(function* comparing() {
           const before = yield* Ref.get(ref)
-          const seen = yield* underWay
-          const was = new Map(before.underWay.map((t) => [t.thread, t]))
-          const now = new Map(seen.map((t) => [t.thread, t]))
+          const seen = yield* open
+          const was = new Map(before.threads.map((t) => [t.thread, t]))
           const done: Finished[] = []
-          if (seeded) {
-            for (const [id, w] of was) {
-              const n = now.get(id)
-              if (n === undefined || n.run !== w.run) {
-                const told = yield* tellFinished(w).pipe(
-                  Effect.catch((error) =>
-                    Effect.as(Effect.logWarning(error), Option.none<Finished>()),
-                  ),
-                )
-                if (Option.isSome(told)) {
-                  done.push(told.value)
-                }
+          const tell: Tell = (t, runId) =>
+            Effect.gen(function* telling() {
+              const told = yield* tellFinished(t, runId).pipe(
+                Effect.catch((error) =>
+                  Effect.as(Effect.logWarning(error), Option.none<Finished>()),
+                ),
+              )
+              if (Option.isSome(told)) {
+                done.push(told.value)
               }
-            }
-            for (const [id, n] of now) {
-              const w = was.get(id)
-              if (n.status === "waiting" && (w?.status !== "waiting" || w.run !== n.run)) {
-                yield* tellWaiting(n).pipe(Effect.catch((error) => Effect.logWarning(error)))
-              }
+            })
+          const threads: Tracked[] = []
+          for (const n of seen) {
+            const w = was.get(n.thread)
+            // Nothing to compare the first look with: it only seeds.
+            const told = seeded ? yield* compare(n, w, tell) : seed(n)
+            threads.push({ ...n, told })
+          }
+          // Gone from the open list (settled, archived, removed) while a run was under way.
+          const listed = new Set(seen.map((t) => t.thread))
+          for (const w of was.values()) {
+            const run = untold(w)
+            if (seeded && !listed.has(w.thread) && run !== null) {
+              yield* tell(w, run)
             }
           }
           seeded = true
           const next: State = {
-            // A thread's start under way is when it was first seen so.
-            underWay: seen.map((t) => {
-              const w = was.get(t.thread)
-              return w && w.run === t.run ? { ...t, since: w.since } : t
-            }),
+            threads,
             recent: [...done.toReversed(), ...before.recent].slice(0, RECENT),
           }
           yield* Ref.set(ref, next)
@@ -363,7 +402,15 @@ const threads = tool(
     Effect.gen(function* listing() {
       const s = yield* (yield* Watch).read
       return {
-        underWay: s.underWay.map((t) => ({ ...t, link: link(t.thread) })),
+        underWay: s.threads
+          .filter((t) => isUnderWay(t.status))
+          .map((t) => ({
+            thread: t.thread,
+            title: t.title,
+            project: t.project,
+            status: t.status,
+            link: link(t.thread),
+          })),
         ended: s.recent.map((t) => ({ ...t, link: link(t.thread) })),
       }
     }),
