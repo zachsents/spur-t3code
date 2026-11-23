@@ -1,10 +1,11 @@
 // A local T3 Code server, through its MCP endpoint. Where it listens is in its runtime file; the
 // extension holds a read-only client session minted by T3's own CLI, kept in a file of its own and
 // renewed before it expires.
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { Data, Effect, Option, Schema } from "effect"
+import { writeFileAtomic } from "switch-ext-kit"
 
 const T3_HOME = process.env.T3CODE_HOME ?? path.join(homedir(), ".t3")
 const RUNTIME_FILE = path.join(T3_HOME, "userdata", "server-runtime.json")
@@ -133,9 +134,7 @@ export const makeT3 = (sessionFile: string): T3 => {
       "--json",
     ])
     const made = decodeSession(out)
-    mkdirSync(path.dirname(sessionFile), { recursive: true })
-    writeFileSync(sessionFile, JSON.stringify(made), { mode: 0o600 })
-    chmodSync(sessionFile, 0o600)
+    writeFileAtomic(sessionFile, JSON.stringify(made), 0o600)
     session = made
     mcpSession = undefined
     if (old) {
