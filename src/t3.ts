@@ -15,9 +15,13 @@ const SESSION_TTL = "30d"
 /** Renewed this long before it runs out. */
 const RENEW = Temporal.Duration.from({ hours: 48 })
 
-export class Unreachable extends Data.TaggedError("Unreachable")<{ readonly reason: string }> {}
+export class Unreachable extends Data.TaggedError("Unreachable")<{
+  readonly reason: string
+  /** T3 Code simply isn't running: nothing is wrong. */
+  readonly off?: boolean
+}> {}
 
-const Runtime = Schema.Struct({ origin: Schema.String })
+const Runtime = Schema.Struct({ origin: Schema.String, pid: Schema.optionalKey(Schema.Number) })
 const SessionJson = Schema.Struct({
   sessionId: Schema.String,
   token: Schema.String,
@@ -56,6 +60,28 @@ const readText = (file: string) => {
 const fail = (reason: string): never => {
   throw new Unreachable({ reason })
 }
+
+const off = (): never => {
+  throw new Unreachable({ reason: "T3 Code isn't running", off: true })
+}
+
+/** Whether the server its runtime file names is alive; true when the file names none. */
+const serverAlive = () =>
+  Option.match(decodeRuntime(readText(RUNTIME_FILE)), {
+    onNone: () => false,
+    onSome: (r) => {
+      if (r.pid === undefined) {
+        return true
+      }
+      try {
+        process.kill(r.pid, 0)
+        return true
+      } catch (error) {
+        // EPERM: alive, but not ours to signal.
+        return error instanceof Error && "code" in error && error.code === "EPERM"
+      }
+    },
+  })
 
 const run = async (args: readonly string[]) => {
   const proc = Bun.spawn([CLI, ...args], { stdout: "pipe", stderr: "pipe" })
@@ -155,7 +181,7 @@ export const makeT3 = (sessionFile: string): T3 => {
     origin ??= Option.getOrUndefined(
       Option.map(decodeRuntime(readText(RUNTIME_FILE)), (r) => r.origin),
     )
-    return origin ?? fail("T3 Code isn't running")
+    return origin ?? off()
   }
 
   const post = async (message: object) => {
@@ -169,19 +195,20 @@ export const makeT3 = (sessionFile: string): T3 => {
       headers["mcp-session-id"] = mcpSession
       headers["mcp-protocol-version"] = PROTOCOL
     }
+    const url = new URL("/mcp", where())
     let response: Response
     try {
-      response = await fetch(new URL("/mcp", where()), {
+      response = await fetch(url, {
         method: "POST",
         headers,
         body: JSON.stringify(message),
         signal: AbortSignal.timeout(30_000),
       })
     } catch {
-      // It may have restarted on another port.
+      // It may have restarted on another port, or quit.
       origin = undefined
       mcpSession = undefined
-      return fail("Can't reach T3 Code")
+      return serverAlive() ? fail("Can't reach T3 Code") : off()
     }
     mcpSession = response.headers.get("mcp-session-id") ?? mcpSession
     const text = await response.text()

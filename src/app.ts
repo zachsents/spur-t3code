@@ -2,15 +2,17 @@
 // T3 pushes nothing to an outside client, so its MCP endpoint is polled: each project's open
 // (unsettled) threads and their latest runs, compared with the last look, so a turn shorter than
 // the poll is still told. The last look is kept in a file, so is a turn that ends while the
-// extension is down.
+// extension is down. Each project, thread and turn is its own: one that fails is kept and tried
+// again the next look while the rest go on, and the heartbeat says so.
 import { readFileSync } from "node:fs"
 import path from "node:path"
-import { Context, Effect, Layer, Option, Ref, Schema } from "effect"
+import { Cause, Context, Effect, Layer, Option, Ref, Schema } from "effect"
 import { AppEvents, defineApp, defineEvent, tool, writeFileAtomic } from "switch-ext-kit"
 import type { Draft } from "switch-ext-kit"
 
+import { attempt, Heartbeat, makeHeart, some, why } from "./heartbeat.ts"
 import { makeT3 } from "./t3.ts"
-import type { T3 } from "./t3.ts"
+import type { T3, Unreachable } from "./t3.ts"
 
 const POLL = "4 seconds"
 /** A thread first seen with a turn that ended is told only if it ended this lately. */
@@ -19,6 +21,8 @@ const UNDER_WAY = ["preparing", "queued", "starting", "running", "waiting"] as c
 const ENDED = ["completed", "failed", "interrupted", "cancelled", "rolled_back"] as const
 const REPLY_CHARS = 2000
 const RECENT = 20
+/** An ended turn that couldn't be told is tried again for this long. */
+const OWED = Temporal.Duration.from({ hours: 24 })
 
 const link = (thread: string) => `t3-thread://v1/${thread}`
 
@@ -121,8 +125,20 @@ const tracked = Schema.Struct({
   /** The last run told as ended. */
   told: Schema.NullOr(Schema.String),
   updatedAt: Schema.String,
+  /** Why its wait couldn't be told; it's tried again the next look. */
+  unasked: Schema.optionalKey(Schema.String),
 })
 type Tracked = typeof tracked.Type
+/** A turn that ended but couldn't be told, and why. */
+const owed = Schema.Struct({
+  thread: Schema.String,
+  title: Schema.String,
+  project: Schema.String,
+  run: Schema.String,
+  since: Schema.String,
+  why: Schema.String,
+})
+type Owed = typeof owed.Type
 const finished = Schema.Struct({
   thread: Schema.String,
   title: Schema.String,
@@ -134,6 +150,7 @@ type Finished = typeof finished.Type
 const state = Schema.Struct({
   threads: Schema.Array(tracked),
   recent: Schema.Array(finished),
+  owed: Schema.optionalKey(Schema.Array(owed)),
 })
 type State = typeof state.Type
 const decodeState = Schema.decodeUnknownSync(Schema.fromJsonString(state))
@@ -154,12 +171,17 @@ const untold = (t: Tracked) =>
 /** What the first look keeps as told: a run that already ended. */
 const seed = (t: Tracked) => (isEnded(t.status) ? t.run : null)
 
-type Tell = (t: Tracked, runId: string) => Effect.Effect<void>
+type Where = Pick<Tracked, "thread" | "title" | "project">
+type Tell = (t: Where, runId: string) => Effect.Effect<void>
 
 const isReply = (i: { readonly type: string; readonly text?: string | null }) =>
   i.type === "assistant_message" && typeof i.text === "string" && i.text !== ""
 
 const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max)}…` : text)
+
+const reasonOf = (e: Unreachable | string) => (typeof e === "string" ? e : e.reason)
+const isOff = (e: Unreachable | string) => typeof e !== "string" && e.off === true
+const named = (t: Where) => `${t.title} (${t.thread})`
 
 export class Watch extends Context.Service<
   Watch,
@@ -189,11 +211,13 @@ export class Watch extends Context.Service<
         let seeded = Option.isSome(loaded)
         const projects = new Map<string, string>()
 
+        const heart = makeHeart(events)
+        let reachable = false
         const save = (s: State) =>
           Effect.sync(() => {
             writeFileAtomic(file, JSON.stringify(s))
           })
-        const emit = (draft: Draft) => Effect.ignore(events.emit(draft))
+        const emit = (draft: Draft) => events.emit(draft)
         const projectName = (id: string) => projects.get(id) ?? id
 
         const loadProjects = Effect.gen(function* listing() {
@@ -206,20 +230,39 @@ export class Watch extends Context.Service<
           }
         })
 
-        /** Every project's open threads, but a provider's own subagents, which run inside their parent's turn. */
+        /**
+         * Every project's open threads, but a provider's own subagents, which run inside their
+         * parent's turn; and the projects that couldn't be read, and why. T3 Code quitting midway
+         * fails the whole look.
+         */
         const open = Effect.gen(function* looking() {
           yield* loadProjects
           const seen: Tracked[] = []
+          const missed = new Map<string, string>()
           for (const [id, title] of projects) {
-            const list = yield* t3
+            const got = yield* t3
               .call("t3_thread_list", {
                 projectId: id,
                 settled: false,
                 includeSubagents: false,
                 limit: 100,
               })
-              .pipe(Effect.flatMap(decode(ThreadList)))
-            for (const t of list.threads) {
+              .pipe(
+                Effect.flatMap(decode(ThreadList)),
+                Effect.map(Option.some),
+                Effect.catch((error) =>
+                  isOff(error)
+                    ? Effect.fail(error)
+                    : Effect.sync(() => {
+                        missed.set(title, reasonOf(error))
+                        return Option.none<typeof ThreadList.Type>()
+                      }),
+                ),
+              )
+            if (Option.isNone(got)) {
+              continue
+            }
+            for (const t of got.value.threads) {
               if (t.relationshipToParent !== "subagent") {
                 seen.push({
                   thread: t.threadId,
@@ -233,7 +276,7 @@ export class Watch extends Context.Service<
               }
             }
           }
-          return seen
+          return { seen, missed }
         })
 
         const readThread = (thread: string, args: object = {}) =>
@@ -256,7 +299,7 @@ export class Watch extends Context.Service<
           })
 
         /** Tells that `runId` ended, if it did. */
-        const tellFinished = (was: Tracked, runId: string) =>
+        const tellFinished = (was: Where, runId: string) =>
           Effect.gen(function* telling() {
             const head = yield* readThread(was.thread, { limit: 1, runLimit: 5 })
             const run = head.recentRuns.find((r) => r.runId === runId)
@@ -316,7 +359,10 @@ export class Watch extends Context.Service<
             )
           })
 
-        /** What changed on one open thread since the last look; answers the last run told. */
+        /**
+         * What changed on one open thread since the last look; answers the last run told, and why
+         * its wait couldn't be told, if it couldn't.
+         */
         const compare = (n: Tracked, w: Tracked | undefined, tell: Tell) =>
           Effect.gen(function* comparingOne() {
             let told = w ? w.told : null
@@ -330,37 +376,71 @@ export class Watch extends Context.Service<
               yield* tell(n, n.run)
               told = n.run
             }
-            if (n.status === "waiting" && (w?.status !== "waiting" || w.run !== n.run)) {
-              yield* tellWaiting(n).pipe(Effect.catch((error) => Effect.logWarning(error)))
-            }
-            return told
+            const asking =
+              n.status === "waiting" &&
+              (w?.status !== "waiting" || w.run !== n.run || w.unasked !== undefined)
+            const unasked = asking ? yield* attempt(tellWaiting(n)) : null
+            return { told, unasked }
           })
 
         const look = Effect.gen(function* comparing() {
           const before = yield* Ref.get(ref)
-          const seen = yield* open
+          const { seen, missed } = yield* open
+          reachable = true
           const was = new Map(before.threads.map((t) => [t.thread, t]))
           const done: Finished[] = []
-          const tell: Tell = (t, runId) =>
-            Effect.gen(function* telling() {
-              const told = yield* tellFinished(t, runId).pipe(
-                Effect.catch((error) =>
-                  Effect.as(Effect.logWarning(error), Option.none<Finished>()),
-                ),
-              )
-              if (Option.isSome(told)) {
-                done.push(told.value)
-              }
-            })
+          const now = Temporal.Now.instant()
+          const stillOwed: Owed[] = []
+          const tellOwing =
+            (since: string): Tell =>
+            (t, runId) =>
+              Effect.gen(function* telling() {
+                const told = yield* Effect.exit(tellFinished(t, runId))
+                if (told._tag === "Failure") {
+                  const { thread, title, project } = t
+                  stillOwed.push({
+                    thread,
+                    title,
+                    project,
+                    run: runId,
+                    since,
+                    why: why(told.cause),
+                  })
+                } else if (Option.isSome(told.value)) {
+                  done.push(told.value.value)
+                }
+              })
+          const tell = tellOwing(now.toString())
+          // Turns that couldn't be told before, but one a day old is let go.
+          for (const o of before.owed ?? []) {
+            if (Temporal.Instant.compare(Temporal.Instant.from(o.since).add(OWED), now) >= 0) {
+              yield* tellOwing(o.since)(o, o.run)
+            }
+          }
           const threads: Tracked[] = []
+          const unreadable: [string, string][] = []
           for (const n of seen) {
             const w = was.get(n.thread)
             // Nothing to compare the first look with: it only seeds.
-            const told = seeded ? yield* compare(n, w, tell) : seed(n)
-            threads.push({ ...n, told })
+            const got = yield* Effect.exit(
+              seeded ? compare(n, w, tell) : Effect.succeed({ told: seed(n), unasked: null }),
+            )
+            if (got._tag === "Failure") {
+              // Kept as it was, so the next look compares it again.
+              unreadable.push([named(n), why(got.cause)])
+              if (w !== undefined) {
+                threads.push(w)
+              }
+              continue
+            }
+            const { told, unasked } = got.value
+            threads.push({ ...n, told, ...(unasked === null ? {} : { unasked }) })
           }
+          // A project that couldn't be read keeps its threads as they were.
+          const kept = before.threads.filter((t) => missed.has(t.project))
+          threads.push(...kept)
           // Gone from the open list (settled, archived, removed) while a run was under way.
-          const listed = new Set(seen.map((t) => t.thread))
+          const listed = new Set([...seen, ...kept].map((t) => t.thread))
           for (const w of was.values()) {
             const run = untold(w)
             if (seeded && !listed.has(w.thread) && run !== null) {
@@ -371,19 +451,49 @@ export class Watch extends Context.Service<
           const next: State = {
             threads,
             recent: [...done.toReversed(), ...before.recent].slice(0, RECENT),
+            owed: stillOwed,
           }
           yield* Ref.set(ref, next)
-          yield* save(next)
+          heart.set("state", yield* attempt(save(next)))
+          heart.set("projects", some([...missed]))
+          heart.set("threads", some(unreadable))
+          heart.set("turns not told", some(stillOwed.map((o) => [named(o), o.why] as const)))
+          const waits = threads.flatMap((t) =>
+            t.unasked === undefined ? [] : [[named(t), t.unasked] as const],
+          )
+          heart.set("waits not told", some(waits))
+          return missed.size + unreadable.length + waits.length
         })
 
-        yield* Effect.forkScoped(
-          Effect.forever(
-            look.pipe(
-              Effect.catch(() => Effect.void),
-              Effect.andThen(Effect.sleep(POLL)),
-            ),
-          ),
-        )
+        let skipped = 0
+        /** One look, whatever it meets, then the beat. */
+        const round = Effect.gen(function* rounding() {
+          const got = yield* Effect.exit(look)
+          if (got._tag === "Success") {
+            skipped = got.value
+            heart.set("T3 Code", null)
+          } else {
+            const e = Cause.squash(got.cause)
+            reachable = false
+            // T3 Code simply not running is no failure.
+            heart.set(
+              "T3 Code",
+              typeof e === "object" && e !== null && "off" in e && e.off === true
+                ? null
+                : why(got.cause),
+            )
+          }
+          const s = yield* Ref.get(ref)
+          yield* heart.beat({
+            reachable,
+            threads: s.threads.length,
+            underWay: s.threads.filter((t) => isUnderWay(t.status)).length,
+            untold: s.owed?.length ?? 0,
+            skipped,
+          })
+        })
+
+        yield* Effect.forkScoped(Effect.forever(Effect.andThen(round, Effect.sleep(POLL))))
 
         return { t3, read: Ref.get(ref), projectName }
       }),
@@ -463,5 +573,5 @@ export const t3codeApp = defineApp<Watch>({
   instructions:
     "T3 Code, the coding agent app on this computer: its threads (threads, thread), and an event when an agent's turn ends (t3code.turn_finished) or a thread waits on the user (t3code.needs_input). To tell the user when one finishes, expect its turn_finished.",
   tools: [threads, thread],
-  events: [TurnFinished, NeedsInput],
+  events: [TurnFinished, NeedsInput, Heartbeat],
 })
