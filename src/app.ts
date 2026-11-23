@@ -3,10 +3,10 @@
 // (unsettled) threads and their latest runs, compared with the last look, so a turn shorter than
 // the poll is still told. The last look is kept in a file, so is a turn that ends while the
 // extension is down.
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { readFileSync } from "node:fs"
 import path from "node:path"
 import { Context, Effect, Layer, Option, Ref, Schema } from "effect"
-import { AppEvents, defineApp, defineEvent, tool } from "switch-ext-kit"
+import { AppEvents, defineApp, defineEvent, tool, writeFileAtomic } from "switch-ext-kit"
 import type { Draft } from "switch-ext-kit"
 
 import { makeT3 } from "./t3.ts"
@@ -191,8 +191,7 @@ export class Watch extends Context.Service<
 
         const save = (s: State) =>
           Effect.sync(() => {
-            mkdirSync(path.dirname(file), { recursive: true })
-            writeFileSync(file, JSON.stringify(s))
+            writeFileAtomic(file, JSON.stringify(s))
           })
         const emit = (draft: Draft) => Effect.ignore(events.emit(draft))
         const projectName = (id: string) => projects.get(id) ?? id
