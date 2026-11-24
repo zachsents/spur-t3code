@@ -1,6 +1,7 @@
 // A local T3 Code server, through its MCP endpoint. Where it listens is in its runtime file; the
 // extension holds a read-only client session minted by T3's own CLI, kept in a file of its own and
-// renewed before it expires.
+// renewed before it expires. Writes go through T3's CLI (`t3 thread`), which signs in as the
+// machine's owner for each command: a session the CLI issues can't act on a full-access thread.
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
@@ -123,6 +124,8 @@ const envelopes = (contentType: string, text: string) => {
 export interface T3 {
   /** Calls one of T3's MCP tools and answers with its structured result. */
   readonly call: (name: string, args: object) => Effect.Effect<unknown, Unreachable>
+  /** Runs T3's CLI and answers with what it printed. */
+  readonly cli: (args: readonly string[]) => Effect.Effect<string, Unreachable>
 }
 
 /** A client of the T3 Code server on this machine; `sessionFile` keeps its credential. */
@@ -286,6 +289,11 @@ export const makeT3 = (sessionFile: string): T3 => {
     call: (name, args) =>
       Effect.tryPromise({
         try: async () => await callOnce(name, args),
+        catch: (e) => (e instanceof Unreachable ? e : new Unreachable({ reason: String(e) })),
+      }),
+    cli: (args) =>
+      Effect.tryPromise({
+        try: async () => await run(args),
         catch: (e) => (e instanceof Unreachable ? e : new Unreachable({ reason: String(e) })),
       }),
   }

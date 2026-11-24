@@ -3,7 +3,8 @@
 // (unsettled) threads and their latest runs, compared with the last look, so a turn shorter than
 // the poll is still told. The last look is kept in a file, so is a turn that ends while the
 // extension is down. Each project, thread and turn is its own: one that fails is kept and tried
-// again the next look while the rest go on, and the heartbeat says so.
+// again the next look while the rest go on, and the heartbeat says so. Messages to threads, and new
+// threads, go through T3's CLI.
 import { readFileSync } from "node:fs"
 import path from "node:path"
 import { Cause, Context, Effect, Layer, Option, Ref, Schema } from "effect"
@@ -67,6 +68,8 @@ const ThreadRead = Schema.Struct({
     }),
   ),
 })
+const Launched = Schema.Struct({ threadId: Schema.String })
+const Sent = Schema.Struct({ threadId: Schema.String, delivery: Schema.String })
 const PendingList = Schema.Struct({ requestIds: Schema.Array(Schema.String) })
 const PendingRead = Schema.Struct({
   questions: Schema.Array(
@@ -567,11 +570,75 @@ const thread = tool(
     }),
 )
 
+/** The words as they reach the thread: a user turn, so it says who sent it and where to answer. */
+const fromSwitch = (space: string, text: string) =>
+  `(From Switch, space ${space}: answer with the switch tools post or ask.)\n\n${text}`
+
+const projects = tool(
+  "projects",
+  { description: "T3 Code's projects, to start a thread in.", readOnly: true },
+  () =>
+    Effect.gen(function* listing() {
+      const list = yield* (yield* Watch).t3.call("t3_project_list", { limit: 100 }).pipe(
+        Effect.mapError((e) => e.reason),
+        Effect.flatMap(decode(ProjectList)),
+      )
+      return list.projects.map((p) => ({ project: p.id, title: p.title }))
+    }),
+)
+
+const send = tool(
+  "send",
+  {
+    description:
+      "Sends a message into a T3 Code thread; a busy thread gets it as its next turn. space: the Switch space its agent should answer in.",
+    input: Schema.Struct({ thread: Schema.String, space: Schema.String, text: Schema.String }),
+  },
+  (input) =>
+    Effect.gen(function* sending() {
+      const out = yield* (yield* Watch).t3
+        .cli(["thread", "send", "--json", input.thread, fromSwitch(input.space, input.text)])
+        .pipe(Effect.mapError((e) => e.reason))
+      const sent = yield* decode(Schema.fromJsonString(Sent))(out)
+      return { thread: sent.threadId, delivery: sent.delivery, link: link(sent.threadId) }
+    }),
+)
+
+const start = tool(
+  "start",
+  {
+    description:
+      "Starts a T3 Code thread in a project (from projects) with a first message. space: the Switch space its agent should answer in.",
+    input: Schema.Struct({
+      project: Schema.String,
+      title: Schema.String,
+      space: Schema.String,
+      text: Schema.String,
+    }),
+  },
+  (input) =>
+    Effect.gen(function* starting() {
+      const out = yield* (yield* Watch).t3
+        .cli([
+          "thread",
+          "start",
+          "--json",
+          "--title",
+          input.title,
+          input.project,
+          fromSwitch(input.space, input.text),
+        ])
+        .pipe(Effect.mapError((e) => e.reason))
+      const launched = yield* decode(Schema.fromJsonString(Launched))(out)
+      return { thread: launched.threadId, link: link(launched.threadId) }
+    }),
+)
+
 export const t3codeApp = defineApp<Watch>({
   name: "t3code",
   version: "1",
   instructions:
-    "T3 Code, the coding agent app on this computer: its threads (threads, thread), and an event when an agent's turn ends (t3code.turn_finished) or a thread waits on the user (t3code.needs_input). To tell the user when one finishes, expect its turn_finished.",
-  tools: [threads, thread],
+    "T3 Code, the coding agent app on this computer: its threads (threads, thread), messages into them (send) and new ones (projects, start), and an event when an agent's turn ends (t3code.turn_finished) or a thread waits on the user (t3code.needs_input). To tell the user when one finishes, expect its turn_finished.",
+  tools: [threads, thread, projects, send, start],
   events: [TurnFinished, NeedsInput, Heartbeat],
 })
