@@ -30,6 +30,7 @@
   "extension": {
     "name": "t3code",
     "main": "src/main.ts",
+    "heartbeat": 360000,
     "needs": [
       "macos"
     ]
