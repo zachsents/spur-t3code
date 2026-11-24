@@ -1,3 +1,5 @@
+**Moved to [zachsents/switch](https://github.com/zachsents/switch/tree/main/extensions/t3code).** This repo is archived.
+
 # switch-ext-t3code
 
 [T3 Code](https://github.com/pingdotgg/t3code)'s threads: an event when an agent's turn ends
